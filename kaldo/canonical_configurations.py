@@ -1,0 +1,90 @@
+from dataclasses import dataclass
+import numpy as np
+import ase.units as units
+
+from kaldo.util import planck
+
+@dataclass(frozen=True)
+class CanonicalConfiguration:
+    """One configuration sampled from the harmonic canonical ensemble. """
+    index: int
+    displacements: np.ndarray  # shape: (n_modes,) --> (ux1, uy1, uz1, ux2, uy2, uz2, ...)
+    random_numbers: np.ndarray  # shape: (n_modes,)
+
+
+class CanonicalConfigurations:
+
+    def __init__(
+        self,
+        n_configs : int,
+        temperature : float,
+        quantum : bool = False,
+        #TODO HOW TO GET SUPERCELL IFCs or freqs + e-vecs
+    ):
+        self.n_configs = n_configs
+        self.temperature = temperature
+        self.quantum = quantum
+
+        self.n_modes = ???
+
+        #! NEED TO PASS SUPERCELL FREQUENCIES, EIGENVECTORS, MASSES
+        #! EVECS SHOULD BE THE ROWS
+        #! NEED TO BE CAREFUL OF UNITS TOO
+        self.prefactors = self._prepare()
+        self.randn_storage = np.zeros(self.n_modes)
+        self.tmp_storage = np.zeros((self.n_modes, self.n_modes))
+    
+    def _quantum_amplitude(self, frequency : float, mass : float) -> float:
+        n = planck(self.temperature, frequency)
+        return np.sqrt((units._hbar * (2*n + 1)) / (2 * mass * frequency))
+
+    def _classical_amplitude(self, frequency : float, mass : float) -> float:
+        return np.sqrt((units._k * self.temperature) / mass) / frequency
+
+    def _amplitude(self, frequencies : np.ndarray[float], masses : np.ndarray[float]) -> float:
+        #TODO FREQ_TOL IS DEFINED IN TDEP BUT KALDO DOESNT HAVE THIS CONCEPT
+        mask = frequencies < freq_tol
+        
+        if self.quantum:
+            out =  self._quantum_amplitude(frequencies, masses)
+        else:
+            out =  self._classical_amplitude(frequencies, masses)
+
+        # Apply mask to avoid division by zero and overflow
+        return np.where(mask, 0.0, out)
+
+    def _prepare(self, frequencies, masses, eigenvectors, dim : int = 3):
+        # Sort things by frequency
+        if np.amin(frequencies) < 0:
+            raise ValueError("Imaginary modes detected, cannot generate canonical configurations")
+
+        # Extend masses from N_atoms to N_modes
+        masses_extended = np.repeat(np.asarray(masses, dtype=float), int(dim))
+
+        # Update dimensions so broadcasting works properly
+        frequencies = frequencies[:, None] # shape: (N_modes, 1)
+        masses_extended = masses_extended[None, :] # shape: (1, N_modes)
+
+        # Amplitude of each mode, dimensions give N_modes x N_modes result
+        # [[w1*m1, w1*m2, w1*m3, ...], [w2*m1, w2*m2, w2*m3, ...], ...]
+        mean_amplitude_matrix = self._amplitude(frequencies, masses_extended)
+        # Pre-scale modes by their average amplitudes, evecs must be rows
+        prefactors = np.multiply(eigenvectors, mean_amplitude_matrix) 
+
+        return prefactors
+
+
+    def __len__(self):
+        return self.n_configs
+
+    def configurations(self):
+        #! Embaressing parallel if each thread has its own randn_storage, tmp_storage
+        #! maybe some issues with rng state too idk
+        rng = np.random.default_rng()
+        for i in range(self.n_configs):
+            rng.standard_normal(out = self.randn_storage)
+            np.copyto(self.tmp_storage, self.prefactors)
+            # Scale average mode amplitudes by random number
+            self.tmp_storage *= self.randn_storage
+            # Convert to displacements
+            yield CanonicalConfiguration(i, np.sum(self.tmp_storage, axis = 0), np.copy(self.randn_storage))
