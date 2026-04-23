@@ -1,13 +1,14 @@
 from dataclasses import dataclass
 import numpy as np
 import ase.units as units
-
+from typing import Callable, TypeVar
 from kaldo.util import planck
+
+T = TypeVar('T')
 
 @dataclass(frozen=True)
 class CanonicalConfiguration:
     """One configuration sampled from the harmonic canonical ensemble. """
-    index: int
     displacements: np.ndarray  # shape: (n_modes,) --> (ux1, uy1, uz1, ux2, uy2, uz2, ...)
     random_numbers: np.ndarray  # shape: (n_modes,)
 
@@ -16,14 +17,14 @@ class CanonicalConfigurations:
 
     def __init__(
         self,
-        n_configs : int,
         temperature : float,
         quantum : bool = False,
+        rng = np.random.default_rng()
         #TODO HOW TO GET SUPERCELL IFCs or freqs + e-vecs
     ):
-        self.n_configs = n_configs
         self.temperature = temperature
         self.quantum = quantum
+        self.rng = rng
 
         self.n_modes = ???
 
@@ -42,29 +43,35 @@ class CanonicalConfigurations:
         return np.sqrt((units._k * self.temperature) / mass) / frequency
 
     def _amplitude(self, frequencies : np.ndarray[float], masses : np.ndarray[float]) -> float:
+        out = np.zeros_like(frequencies, dtype=float)
+
         #TODO FREQ_TOL IS DEFINED IN TDEP BUT KALDO DOESNT HAVE THIS CONCEPT
-        mask = frequencies < freq_tol
-        
+        valid = np.abs(frequencies) >= freq_tol
+
         if self.quantum:
-            out =  self._quantum_amplitude(frequencies, masses)
+            out[valid] = self._quantum_amplitude(frequencies[valid], masses[valid])
         else:
-            out =  self._classical_amplitude(frequencies, masses)
+            out[valid] = self._classical_amplitude(frequencies[valid], masses[valid])
 
-        # Apply mask to avoid division by zero and overflow
-        return np.where(mask, 0.0, out)
+        return out
 
-    def _prepare(self, frequencies, masses, eigenvectors, dim : int = 3):
-        # Sort things by frequency
+    def _prepare(
+        self,
+        frequencies : np.ndarray[float], # (n_modes,)
+        masses : np.ndarray[float], # (n_modes,)
+        eigenvectors : np.ndarray[float], # (n_modes, n_modes)
+        dim : int = 3
+        ) -> np.ndarray[float]:
+
+        # Check for imaginary modes
         if np.amin(frequencies) < 0:
             raise ValueError("Imaginary modes detected, cannot generate canonical configurations")
 
         # Extend masses from N_atoms to N_modes
         masses_extended = np.repeat(np.asarray(masses, dtype=float), int(dim))
-
         # Update dimensions so broadcasting works properly
         frequencies = frequencies[:, None] # shape: (N_modes, 1)
         masses_extended = masses_extended[None, :] # shape: (1, N_modes)
-
         # Amplitude of each mode, dimensions give N_modes x N_modes result
         # [[w1*m1, w1*m2, w1*m3, ...], [w2*m1, w2*m2, w2*m3, ...], ...]
         mean_amplitude_matrix = self._amplitude(frequencies, masses_extended)
@@ -73,18 +80,19 @@ class CanonicalConfigurations:
 
         return prefactors
 
-
-    def __len__(self):
+    def __len__(self) -> int:
         return self.n_configs
 
-    def configurations(self):
-        #! Embaressing parallel if each thread has its own randn_storage, tmp_storage
-        #! maybe some issues with rng state too idk
-        rng = np.random.default_rng()
-        for i in range(self.n_configs):
-            rng.standard_normal(out = self.randn_storage)
-            np.copyto(self.tmp_storage, self.prefactors)
-            # Scale average mode amplitudes by random number
-            self.tmp_storage *= self.randn_storage
-            # Convert to displacements
-            yield CanonicalConfiguration(i, np.sum(self.tmp_storage, axis = 0), np.copy(self.randn_storage))
+    def _get_displacements(self) -> np.ndarray[float]:
+        self.rng.standard_normal(out = self.randn_storage) # Need to check if this is thread safe
+        np.copyto(self.tmp_storage, self.prefactors)
+        self.tmp_storage *= self.randn_storage # Scale average mode amplitudes by random numbers
+        return np.sum(self.tmp_storage, axis = 0)
+        
+    def get_configuration(self) -> CanonicalConfiguration:  
+        displacements = self._get_displacements()
+        return CanonicalConfiguration(displacements, np.copy(self.randn_storage))
+
+    def apply_to_configuration(self, f : Callable[[np.ndarray, np.ndarray], T]) -> T:
+        displacements = self._get_displacements()
+        return f(displacements, self.randn_storage)
